@@ -1,81 +1,173 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-# Script to implement mouse-follows-focus behavior without
-# relying on a specific window manager. Parts of the script
-# have been taken from the following sources:
-#  - https://stackoverflow.com/questions/5262413/does-xlib-have-an-active-window-event
-#  - http://science.su/stuff/so/print_frame_geometry_of_all_windows.py
-#  - https://stackoverflow.com/questions/12775136/get-window-position-and-size-in-python-with-xlib
+"""
+Mouse-follows-focus for Windows.
 
-# This code is distributed under the MIT License
+Behavior:
+- Detects when the foreground (active) window changes.
+- After a short stabilizing delay, checks whether the mouse is already inside
+  the new window's rectangle.
+- If not, moves the cursor to the center of the new active window.
 
-import Xlib
-import Xlib.display
+Notes:
+- Pure ctypes; no external packages.
+- DPI-aware so coordinates align with modern displays.
+- Skips minimized/hidden windows.
+- Ctrl+C to exit.
+"""
+
 import time
+import ctypes
+from ctypes import wintypes
 
-disp = Xlib.display.Display()
-root = disp.screen().root
+user32 = ctypes.windll.user32
+kernel32 = ctypes.windll.kernel32
+shcore = None
 
-NET_ACTIVE_WINDOW = disp.intern_atom('_NET_ACTIVE_WINDOW')
-
-last_seen = {'xid': None}
-def get_active_window():
-    window_id = root.get_full_property(NET_ACTIVE_WINDOW,
-                                       Xlib.X.AnyPropertyType).value[0]
-
-    focus_changed = (window_id != last_seen['xid'])
-    last_seen['xid'] = window_id
-
-    return window_id, focus_changed
-
-def get_window_geometry(root, window_id):
+# ----- DPI awareness (best-effort) -----
+# Try Per-Monitor V2; fall back to system aware if unavailable.
+# This prevents coordinate mismatches on HiDPI displays.
+try:
+    # Windows 10+: SetProcessDpiAwarenessContext(-4) = PER_MONITOR_AWARE_V2
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = ctypes.c_void_p(-4)
+    user32.SetProcessDpiAwarenessContext.restype = wintypes.BOOL
+    user32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+    if not user32.SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2):
+        raise OSError
+except Exception:
     try:
-        window_obj = disp.create_resource_object('window', window_id)
-        while(window_obj.query_tree().parent != root):
-            window_obj = window_obj.query_tree().parent
-        window_geometry = window_obj.get_geometry()._data
-    except Xlib.error.XError:
-        window_geometry = None
+        # Windows 8.1 API: SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE=2)
+        shcore = ctypes.windll.shcore
+        shcore.SetProcessDpiAwareness.restype = ctypes.c_int  # HRESULT
+        shcore.SetProcessDpiAwareness.argtypes = [ctypes.c_int]
+        shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        # Vista+: SetProcessDPIAware() as weakest fallback
+        try:
+            user32.SetProcessDPIAware()
+        except Exception:
+            pass
 
-    return window_geometry
+# ----- Win32 structures -----
+class RECT(ctypes.Structure):
+    _fields_ = [('left',   wintypes.LONG),
+                ('top',    wintypes.LONG),
+                ('right',  wintypes.LONG),
+                ('bottom', wintypes.LONG)]
 
-def get_mouse_pos(root):
-    x = root.query_pointer()._data['win_x']
-    y = root.query_pointer()._data['win_y']
-    return x, y
+class POINT(ctypes.Structure):
+    _fields_ = [('x', wintypes.LONG),
+                ('y', wintypes.LONG)]
 
+# ----- Win32 function prototypes -----
+user32.GetForegroundWindow.restype = wintypes.HWND
 
-if __name__ == '__main__':
-    root.change_attributes(event_mask=Xlib.X.PropertyChangeMask)
-    while True:
-        win, changed = get_active_window()
-        if changed:
+user32.IsWindowVisible.restype = wintypes.BOOL
+user32.IsWindowVisible.argtypes = [wintypes.HWND]
 
-            # Sleep for a sensible amount of time before looking at window geometry. 
-            # This helps with scripts that re-dimension the window after creating it
-            time.sleep(0.150); # seconds
+user32.IsIconic.restype = wintypes.BOOL
+user32.IsIconic.argtypes = [wintypes.HWND]
 
-            mouseX, mouseY = get_mouse_pos(root)
-            geo = get_window_geometry(root, win);
+user32.GetWindowRect.restype = wintypes.BOOL
+user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
 
-            #print(win, get_window_name(win), get_window_geometry(root, win))
+user32.GetCursorPos.restype = wintypes.BOOL
+user32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
 
-            if geo:
-                if mouseX >= geo['x'] and mouseX <= geo['x'] + geo['width'] and \
-                   mouseY >= geo['y'] and mouseY <= geo['y'] + geo['height']:
-                    #print('Mouse is inside newly focused window')
-                    None
-                else:
-                    #print('Mouse is outside newly focused window')
-                    midX = geo['x'] + geo['width'] // 2
-                    midY = geo['y'] + geo['height'] // 2
+user32.SetCursorPos.restype = wintypes.BOOL
+user32.SetCursorPos.argtypes = [wintypes.INT, wintypes.INT]
 
-                    geo = get_window_geometry(root, win);
-                    root.warp_pointer(midX, midY)
+user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
 
+# Optional: filter out tool windows (owned popups) if desired.
+GWL_EXSTYLE = -20
+WS_EX_TOOLWINDOW = 0x00000080
+try:
+    user32.GetWindowLongW.restype = ctypes.c_long
+    user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+    _has_getwindowlong = True
+except Exception:
+    _has_getwindowlong = False
+
+def hwnd_is_candidate(hwnd: int) -> bool:
+    if not hwnd:
+        return False
+    if not user32.IsWindowVisible(hwnd):
+        return False
+    if user32.IsIconic(hwnd):
+        return False
+    if _has_getwindowlong:
+        ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        if ex & WS_EX_TOOLWINDOW:
+            return False
+    r = RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(r)):
+        return False
+    # Discard zero-area or negative rectangles
+    width = r.right - r.left
+    height = r.bottom - r.top
+    if width <= 0 or height <= 0:
+        return False
+    return True
+
+def get_window_rect(hwnd: int):
+    r = RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(r)):
+        return None
+    return (r.left, r.top, r.right, r.bottom)
+
+def get_cursor_pos():
+    p = POINT()
+    if not user32.GetCursorPos(ctypes.byref(p)):
+        return None
+    return (p.x, p.y)
+
+def point_in_rect(x, y, rect):
+    left, top, right, bottom = rect
+    return (left <= x <= right) and (top <= y <= bottom)
+
+def rect_center(rect):
+    left, top, right, bottom = rect
+    cx = left + (right - left) // 2
+    cy = top + (bottom - top) // 2
+    return (cx, cy)
+
+def move_cursor(x, y):
+    user32.SetCursorPos(int(x), int(y))
+
+def main():
+    last_hwnd = None
+    # Polling interval for foreground changes
+    poll_interval = 0.03  # 30 ms
+    # Stabilizing delay after change (mirrors the original 150 ms)
+    settle_delay = 0.150
+
+    try:
         while True:
-            event = disp.next_event()
-            if (event.type == Xlib.X.PropertyNotify and
-                    event.atom == NET_ACTIVE_WINDOW):
-                break
+            hwnd = user32.GetForegroundWindow()
 
+            if hwnd and hwnd != last_hwnd:
+                last_hwnd = hwnd
+
+                if hwnd_is_candidate(hwnd):
+                    time.sleep(settle_delay)  # let window finish animating/resizing
+
+                    rect = get_window_rect(hwnd)
+                    cur = get_cursor_pos()
+                    if rect and cur:
+                        x, y = cur
+                        if not point_in_rect(x, y, rect):
+                            cx, cy = rect_center(rect)
+                            # Re-check geometry in case it changed during settle delay
+                            rect2 = get_window_rect(hwnd) or rect
+                            cx, cy = rect_center(rect2)
+                            move_cursor(cx, cy)
+
+            time.sleep(poll_interval)
+    except KeyboardInterrupt:
+        pass
+
+if __name__ == "__main__":
+    main()
